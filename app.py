@@ -452,7 +452,6 @@ def _process_image_async(user_id, message_id, reply_token):
             "header": {
                 "type": "box",
                 "layout": "vertical",
-                "backgroundColor": bg_color,
                 "paddingAll": "16px",
                 "contents": [
                     {
@@ -536,7 +535,6 @@ def _process_image_async(user_id, message_id, reply_token):
             "footer": {
                 "type": "box",
                 "layout": "vertical",
-                "backgroundColor": "#FFF8FA",
                 "paddingAll": "12px",
                 "contents": [
                     {
@@ -547,6 +545,14 @@ def _process_image_async(user_id, message_id, reply_token):
                         "align": "center"
                     }
                 ]
+            },
+            "styles": {
+                "header": {
+                    "backgroundColor": bg_color
+                },
+                "footer": {
+                    "backgroundColor": "#FFF8FA"
+                }
             }
         }
 
