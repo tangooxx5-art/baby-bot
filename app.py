@@ -4,6 +4,8 @@ import tempfile
 import logging
 import threading
 import time
+import base64
+import requests
 
 from flask import Flask, request, abort
 from dotenv import load_dotenv
@@ -55,6 +57,20 @@ line_handler = None
 
 # 固定使用的 Gemini 模型（不再動態偵測，節省 API 配額）
 GEMINI_MODEL = 'gemini-2.5-flash'
+
+# --- OpenRouter 備援設定 ---
+OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
+OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1/chat/completions'
+# 免費 vision 模型（按優先順序嘗試）
+OPENROUTER_FREE_MODELS = [
+    'qwen/qwen2.5-vl-32b-instruct:free',
+    'meta-llama/llama-3.2-11b-vision-instruct:free',
+    'google/gemma-3-4b-it:free',
+]
+if OPENROUTER_API_KEY:
+    logger.info(f"OpenRouter fallback enabled with {len(OPENROUTER_FREE_MODELS)} free models")
+else:
+    logger.warning("OPENROUTER_API_KEY not set — fallback disabled")
 
 
 def get_line_config():
@@ -227,8 +243,105 @@ def _call_gemini_with_rotation(genai, image_path, prompt, max_rounds=3):
     )
 
 
+def _call_openrouter_fallback(image_path, prompt):
+    """使用 OpenRouter 免費 vision 模型作為備援"""
+    if not OPENROUTER_API_KEY:
+        raise ValueError("OPENROUTER_API_KEY not configured")
+
+    # 將圖片轉為 base64
+    with open(image_path, 'rb') as f:
+        image_b64 = base64.b64encode(f.read()).decode('utf-8')
+
+    headers = {
+        'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://baby-bot.onrender.com',
+        'X-Title': 'Baby Bot',
+    }
+
+    messages = [
+        {
+            'role': 'user',
+            'content': [
+                {'type': 'text', 'text': prompt},
+                {
+                    'type': 'image_url',
+                    'image_url': {
+                        'url': f'data:image/jpeg;base64,{image_b64}'
+                    }
+                }
+            ]
+        }
+    ]
+
+    last_error = None
+    for model in OPENROUTER_FREE_MODELS:
+        logger.info(f"[OpenRouter] Trying model: {model}")
+        try:
+            resp = requests.post(
+                OPENROUTER_BASE_URL,
+                headers=headers,
+                json={'model': model, 'messages': messages, 'max_tokens': 1024},
+                timeout=60
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                text = data['choices'][0]['message']['content']
+                logger.info(f"[OpenRouter] Success with {model}")
+                return text
+            else:
+                logger.warning(f"[OpenRouter] {model} returned {resp.status_code}: {resp.text[:200]}")
+                last_error = Exception(f"OpenRouter {resp.status_code}: {resp.text[:200]}")
+                continue
+
+        except Exception as e:
+            logger.warning(f"[OpenRouter] {model} failed: {e}")
+            last_error = e
+            continue
+
+    if last_error is not None:
+        raise last_error
+    raise Exception("All OpenRouter models failed")
+
+
+# --- 共用的 prompt ---
+ANALYSIS_PROMPT = """
+請作為一名「暖心孕期助理」，處理傳入的影像：
+- OCR 提取：辨識 GA (週數)、EFW (體重)、EDD (預產期)。
+- 語境生成：
+  1. 使用「第一人稱寶寶語氣」（例如：媽咪，我今天...）。
+  2. 將重量與水果/食物對比（如：200g = 一顆大蘋果）。
+  3. 偵測照片內容（若是 3D 臉部，稱讚鼻子或嘴巴；若是黑白 2D，強調心跳與成長）。
+- 輸出限制：僅輸出 JSON 格式，包含 `weeks`, `weight_status`, `message`, `suggested_color`。
+請勿輸出任何 markdown 標記，直接輸出乾淨的 JSON 字串。
+""".strip()
+
+
+def _parse_ai_response(response_text):
+    """解析 AI 回傳的 JSON 文字"""
+    text = response_text.strip()
+    if text.startswith("```json"):
+        text = text[7:]
+    if text.startswith("```"):
+        text = text[3:]
+    if text.endswith("```"):
+        text = text[:-3]
+
+    try:
+        return json.loads(text.strip())
+    except json.JSONDecodeError as e:
+        logger.error(f"JSON parse failed: {e}, raw: {text[:300]}")
+        return {
+            "weeks": "?",
+            "message": text[:300] if text else "媽咪好！我看不太清楚，可以再傳一次清晰的照片嗎？",
+            "weight_status": "未知",
+            "suggested_color": "#ffcccc"
+        }
+
+
 def _process_image_async(user_id, message_id, reply_token):
-    """在背景處理圖片 — 使用 push message 回傳結果（不受 reply token 時限限制）"""
+    """在背景處理圖片 — Gemini 優先，OpenRouter 備援"""
     import google.generativeai as genai
     from linebot.v3.messaging import (
         ApiClient,
@@ -246,22 +359,6 @@ def _process_image_async(user_id, message_id, reply_token):
     temp_file_path = None
 
     try:
-        # 0. 先檢查全域冷卻，如果在冷卻中就直接回覆，不浪費資源下載圖片
-        in_cooldown, remaining = _is_in_global_cooldown()
-        if in_cooldown:
-            logger.info(f"Skipping image processing — global cooldown active ({remaining}s left)")
-            with ApiClient(config) as api_client:
-                line_bot_api = MessagingApi(api_client)
-                line_bot_api.push_message(
-                    PushMessageRequest(
-                        to=user_id,
-                        messages=[TextMessage(
-                            text=f"寶寶剛剛太忙了，正在休息中～請 {remaining} 秒後再傳照片給我哦 🍼💤"
-                        )]
-                    )
-                )
-            return
-
         # 1. 取得圖片內容
         logger.info(f"[1/4] Downloading image: {message_id}")
         with ApiClient(config) as api_client:
@@ -286,43 +383,40 @@ def _process_image_async(user_id, message_id, reply_token):
         if file_size == 0:
             raise ValueError("Downloaded image is empty (0 bytes)")
 
-        # 2. 使用 Gemini API 分析圖片（支援多 Key 輪替 + 速率限制）
-        logger.info("[3/4] Uploading to Gemini and analyzing...")
+        # 2. 分析圖片：先 Gemini，失敗則用 OpenRouter 備援
+        logger.info("[3/4] Analyzing image...")
+        response_text = None
+        used_provider = None
 
-        prompt = """
-        請作為一名「暖心孕期助理」，處理傳入的影像：
-        - OCR 提取：辨識 GA (週數)、EFW (體重)、EDD (預產期)。
-        - 語境生成：
-          1. 使用「第一人稱寶寶語氣」（例如：媽咪，我今天...）。
-          2. 將重量與水果/食物對比（如：200g = 一顆大蘋果）。
-          3. 偵測照片內容（若是 3D 臉部，稱讚鼻子或嘴巴；若是黑白 2D，強調心跳與成長）。
-        - 輸出限制：僅輸出 JSON 格式，包含 `weeks`, `weight_status`, `message`, `suggested_color`。
-        請勿輸出任何 markdown 標記，直接輸出乾淨的 JSON 字串。
-        """
+        # --- 嘗試 Gemini ---
+        if GEMINI_API_KEYS:
+            try:
+                logger.info("Trying Gemini first...")
+                response = _call_gemini_with_rotation(genai, temp_file_path, ANALYSIS_PROMPT)
+                response_text = response.text.strip()
+                used_provider = 'Gemini'
+            except (QuotaExhaustedError, Exception) as gemini_err:
+                logger.warning(f"Gemini failed: {gemini_err}")
 
-        response = _call_gemini_with_rotation(genai, temp_file_path, prompt)
+        # --- Gemini 失敗，嘗試 OpenRouter ---
+        if response_text is None and OPENROUTER_API_KEY:
+            try:
+                logger.info("Falling back to OpenRouter...")
+                response_text = _call_openrouter_fallback(temp_file_path, ANALYSIS_PROMPT)
+                used_provider = 'OpenRouter'
+            except Exception as or_err:
+                logger.error(f"OpenRouter also failed: {or_err}")
+
+        # --- 都失敗 ---
+        if response_text is None:
+            raise Exception("所有 AI 服務都無法使用（Gemini + OpenRouter）")
+
+        logger.info(f"AI response from {used_provider}: {response_text[:200]}")
 
         # 3. 解析 JSON
-        response_text = response.text.strip()
-        logger.info(f"Gemini raw response: {response_text[:200]}")
+        result_json = _parse_ai_response(response_text)
 
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.startswith("```"):
-            response_text = response_text[3:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
 
-        try:
-            result_json = json.loads(response_text.strip())
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON parse failed: {e}, raw: {response_text[:300]}")
-            result_json = {
-                "weeks": "?",
-                "message": response_text[:300] if response_text else "媽咪好！我看不太清楚，可以再傳一次清晰的照片嗎？",
-                "weight_status": "未知",
-                "suggested_color": "#ffcccc"
-            }
 
         # 4. 組裝 Flex Message 並回傳
         logger.info("[4/4] Sending Flex Message...")
