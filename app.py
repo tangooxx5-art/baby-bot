@@ -56,42 +56,36 @@ def _register_handlers():
 
 
 def _get_best_model(genai):
-    """自動偵測最佳可用的 Gemini 模型（支援圖片分析）"""
+    """自動偵測最佳可用的 Gemini 模型（不呼叫 list_models 以節省配額）"""
     global _cached_model_name
     if _cached_model_name:
         return _cached_model_name
 
-    # 偏好順序：能力較強的排前面
-    preferred_keywords = ['pro', 'flash']
+    # 依偏好順序嘗試，第一個能用的就快取
+    candidates = [
+        'gemini-2.0-flash',
+        'gemini-2.0-pro',
+        'gemini-1.5-flash',
+        'gemini-1.5-pro',
+        'gemini-pro',
+    ]
 
-    try:
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in (m.supported_generation_methods or []):
-                available_models.append(m.name)
-
-        logger.info(f"Available models: {available_models}")
-
-        if not available_models:
-            _cached_model_name = 'gemini-2.0-flash'
+    for name in candidates:
+        try:
+            model = genai.GenerativeModel(name)
+            # 用最輕量的方式測試模型是否存在
+            model.count_tokens("test")
+            _cached_model_name = name
+            logger.info(f"Auto-detected model: {name}")
             return _cached_model_name
+        except Exception as e:
+            logger.info(f"Model {name} not available: {e}")
+            continue
 
-        # 依偏好順序挑選
-        for keyword in preferred_keywords:
-            for model_name in available_models:
-                if keyword in model_name:
-                    clean_name = model_name.replace('models/', '')
-                    _cached_model_name = clean_name
-                    return _cached_model_name
-
-        # 都沒匹配到就用第一個
-        _cached_model_name = available_models[0].replace('models/', '')
-        return _cached_model_name
-
-    except Exception as e:
-        logger.warning(f"Model auto-detection failed: {e}, using default")
-        _cached_model_name = 'gemini-2.0-flash'
-        return _cached_model_name
+    # 全部失敗就用預設
+    _cached_model_name = 'gemini-2.0-flash'
+    logger.warning(f"All model checks failed, defaulting to {_cached_model_name}")
+    return _cached_model_name
 
 
 @app.route("/", methods=['GET'])
