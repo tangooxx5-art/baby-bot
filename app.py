@@ -18,7 +18,16 @@ logger = logging.getLogger(__name__)
 # 載入環境變數
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '')
-GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+
+# 支援多把 Gemini API Key 輪替使用
+GEMINI_API_KEYS = []
+for key_name in ['GEMINI_API_KEY', 'GEMINI_API_KEY_2', 'GEMINI_API_KEY_3']:
+    key = os.environ.get(key_name, '')
+    if key:
+        GEMINI_API_KEYS.append(key)
+logger.info(f"Loaded {len(GEMINI_API_KEYS)} Gemini API key(s)")
+
+_current_key_index = 0  # 目前使用的 Key 索引
 
 # 延遲初始化
 line_configuration = None
@@ -115,6 +124,51 @@ def callback():
     return 'OK'
 
 
+def _call_gemini_with_rotation(genai, image_path, prompt):
+    """使用多把 API Key 輪替呼叫 Gemini，遇到 429 自動切換下一把"""
+    global _current_key_index
+
+    if not GEMINI_API_KEYS:
+        raise ValueError("No Gemini API keys configured!")
+
+    last_error = None
+    for attempt in range(len(GEMINI_API_KEYS)):
+        key_index = (_current_key_index + attempt) % len(GEMINI_API_KEYS)
+        api_key = GEMINI_API_KEYS[key_index]
+        logger.info(f"Trying API Key #{key_index + 1} of {len(GEMINI_API_KEYS)}")
+
+        try:
+            genai.configure(api_key=api_key)
+            sample_file = genai.upload_file(path=image_path, display_name="Ultrasound")
+            model_name = _get_best_model(genai)
+            logger.info(f"Using model: {model_name}")
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content([sample_file, prompt])
+
+            # 清理 Gemini 暫存
+            try:
+                genai.delete_file(sample_file.name)
+            except Exception:
+                pass
+
+            # 成功！更新索引到下一把（下次從這把之後開始輪替）
+            _current_key_index = (key_index + 1) % len(GEMINI_API_KEYS)
+            return response
+
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            if '429' in error_str or 'ResourceExhausted' in error_str:
+                logger.warning(f"API Key #{key_index + 1} hit rate limit, switching to next key...")
+                continue
+            else:
+                # 非 429 錯誤直接拋出
+                raise
+
+    # 所有 Key 都試過了還是 429
+    raise last_error
+
+
 def _process_image_async(user_id, message_id, reply_token):
     """在背景處理圖片 — 使用 push message 回傳結果（不受 reply token 時限限制）"""
     import google.generativeai as genai
@@ -130,7 +184,6 @@ def _process_image_async(user_id, message_id, reply_token):
     )
 
     config, _ = get_line_config()
-    genai.configure(api_key=GEMINI_API_KEY)
 
     temp_file_path = None
 
@@ -159,12 +212,8 @@ def _process_image_async(user_id, message_id, reply_token):
         if file_size == 0:
             raise ValueError("Downloaded image is empty (0 bytes)")
 
-        # 2. 上傳圖片至 Gemini API 並分析（自動偵測模型）
+        # 2. 使用 Gemini API 分析圖片（支援多 Key 輪替）
         logger.info("[3/4] Uploading to Gemini and analyzing...")
-        sample_file = genai.upload_file(path=temp_file_path, display_name="Ultrasound")
-        model_name = _get_best_model(genai)
-        logger.info(f"Using model: {model_name}")
-        model = genai.GenerativeModel(model_name)
 
         prompt = """
         請作為一名「暖心孕期助理」，處理傳入的影像：
@@ -177,13 +226,7 @@ def _process_image_async(user_id, message_id, reply_token):
         請勿輸出任何 markdown 標記，直接輸出乾淨的 JSON 字串。
         """
 
-        response = model.generate_content([sample_file, prompt])
-
-        # 清理 Gemini 暫存
-        try:
-            genai.delete_file(sample_file.name)
-        except Exception:
-            pass
+        response = _call_gemini_with_rotation(genai, temp_file_path, prompt)
 
         # 3. 解析 JSON
         response_text = response.text.strip()
