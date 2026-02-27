@@ -24,6 +24,9 @@ GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
 line_configuration = None
 line_handler = None
 
+# 快取偵測到的模型名稱
+_cached_model_name = None
+
 
 def get_line_config():
     global line_configuration, line_handler
@@ -42,8 +45,6 @@ def _register_handlers():
 
     @line_handler.add(MessageEvent, message=ImageMessageContent)
     def handle_image_message(event):
-        # 在背景線程處理圖片，避免阻塞 webhook 回應
-        # LINE 要求 webhook 在 1 秒內回應 200 OK
         user_id = event.source.user_id
         message_id = event.message.id
         reply_token = event.reply_token
@@ -52,6 +53,45 @@ def _register_handlers():
             args=(user_id, message_id, reply_token)
         )
         thread.start()
+
+
+def _get_best_model(genai):
+    """自動偵測最佳可用的 Gemini 模型（支援圖片分析）"""
+    global _cached_model_name
+    if _cached_model_name:
+        return _cached_model_name
+
+    # 偏好順序：能力較強的排前面
+    preferred_keywords = ['pro', 'flash']
+
+    try:
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in (m.supported_generation_methods or []):
+                available_models.append(m.name)
+
+        logger.info(f"Available models: {available_models}")
+
+        if not available_models:
+            _cached_model_name = 'gemini-2.0-flash'
+            return _cached_model_name
+
+        # 依偏好順序挑選
+        for keyword in preferred_keywords:
+            for model_name in available_models:
+                if keyword in model_name:
+                    clean_name = model_name.replace('models/', '')
+                    _cached_model_name = clean_name
+                    return _cached_model_name
+
+        # 都沒匹配到就用第一個
+        _cached_model_name = available_models[0].replace('models/', '')
+        return _cached_model_name
+
+    except Exception as e:
+        logger.warning(f"Model auto-detection failed: {e}, using default")
+        _cached_model_name = 'gemini-2.0-flash'
+        return _cached_model_name
 
 
 @app.route("/", methods=['GET'])
@@ -109,7 +149,6 @@ def _process_image_async(user_id, message_id, reply_token):
 
         # 將圖片存入暫存檔
         with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tf:
-            # message_content 可能是 bytes 或 response object
             if isinstance(message_content, bytes):
                 tf.write(message_content)
             elif hasattr(message_content, 'read'):
@@ -126,10 +165,12 @@ def _process_image_async(user_id, message_id, reply_token):
         if file_size == 0:
             raise ValueError("Downloaded image is empty (0 bytes)")
 
-        # 2. 上傳圖片至 Gemini API 並分析
+        # 2. 上傳圖片至 Gemini API 並分析（自動偵測模型）
         logger.info("[3/4] Uploading to Gemini and analyzing...")
         sample_file = genai.upload_file(path=temp_file_path, display_name="Ultrasound")
-        model = genai.GenerativeModel('gemini-2.0-flash')
+        model_name = _get_best_model(genai)
+        logger.info(f"Using model: {model_name}")
+        model = genai.GenerativeModel(model_name)
 
         prompt = """
         請作為一名「暖心孕期助理」，處理傳入的影像：
@@ -154,7 +195,6 @@ def _process_image_async(user_id, message_id, reply_token):
         response_text = response.text.strip()
         logger.info(f"Gemini raw response: {response_text[:200]}")
 
-        # 去除可能的 markdown 標記
         if response_text.startswith("```json"):
             response_text = response_text[7:]
         if response_text.startswith("```"):
@@ -173,7 +213,7 @@ def _process_image_async(user_id, message_id, reply_token):
                 "suggested_color": "#ffcccc"
             }
 
-        # 4. 組裝 Flex Message 並用 Push Message 回傳
+        # 4. 組裝 Flex Message 並回傳
         logger.info("[4/4] Sending Flex Message...")
         flex_dict = {
             "type": "bubble",
@@ -220,7 +260,6 @@ def _process_image_async(user_id, message_id, reply_token):
                 )
                 logger.info("Reply message sent successfully!")
             except Exception as reply_err:
-                # Reply token 過期，改用 push message
                 logger.warning(f"Reply failed ({reply_err}), using push message instead")
                 line_bot_api.push_message(
                     PushMessageRequest(
@@ -232,7 +271,6 @@ def _process_image_async(user_id, message_id, reply_token):
 
     except Exception as e:
         logger.error(f"Error processing image: {e}", exc_info=True)
-        # 發生錯誤時也通知使用者
         try:
             with ApiClient(config) as api_client:
                 line_bot_api = MessagingApi(api_client)
