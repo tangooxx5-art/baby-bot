@@ -545,14 +545,6 @@ def _process_image_async(user_id, message_id, reply_token):
                         "align": "center"
                     }
                 ]
-            },
-            "styles": {
-                "header": {
-                    "backgroundColor": bg_color
-                },
-                "footer": {
-                    "backgroundColor": "#FFF8FA"
-                }
             }
         }
 
