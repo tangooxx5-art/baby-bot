@@ -129,7 +129,7 @@ def _process_image_async(user_id, message_id, reply_token):
         # 2. 上傳圖片至 Gemini API 並分析
         logger.info("[3/4] Uploading to Gemini and analyzing...")
         sample_file = genai.upload_file(path=temp_file_path, display_name="Ultrasound")
-        model = genai.GenerativeModel('gemini-1.5-pro')
+        model = genai.GenerativeModel('gemini-2.0-flash')
 
         prompt = """
         請作為一名「暖心孕期助理」，處理傳入的影像：
