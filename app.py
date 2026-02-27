@@ -420,30 +420,131 @@ def _process_image_async(user_id, message_id, reply_token):
 
         # 4. 組裝 Flex Message 並回傳
         logger.info("[4/4] Sending Flex Message...")
+
+        weeks = result_json.get('weeks', '?')
+        message = result_json.get('message', '媽咪好，我是寶寶！')
+        weight_status = result_json.get('weight_status', '')
+        bg_color = result_json.get('suggested_color', '#FFF0F5')
+
+        # 溫馨的寶寶主題圖片（使用免費圖庫）
+        hero_images = [
+            "https://images.unsplash.com/photo-1555252333-9f8e92e65df9?w=800&h=400&fit=crop",
+            "https://images.unsplash.com/photo-1519689680058-324335c77eba?w=800&h=400&fit=crop",
+            "https://images.unsplash.com/photo-1544126592-807ade215a0b?w=800&h=400&fit=crop",
+        ]
+        # 根據週數選不同圖片（增加變化感）
+        try:
+            img_index = int(str(weeks)) % len(hero_images)
+        except (ValueError, TypeError):
+            img_index = 0
+        hero_url = hero_images[img_index]
+
         flex_dict = {
             "type": "bubble",
+            "size": "giga",
+            "hero": {
+                "type": "image",
+                "url": hero_url,
+                "size": "full",
+                "aspectRatio": "20:10",
+                "aspectMode": "cover"
+            },
             "header": {
                 "type": "box",
                 "layout": "vertical",
+                "backgroundColor": bg_color,
+                "paddingAll": "16px",
                 "contents": [
                     {
-                        "type": "text",
-                        "text": f"第 {result_json.get('weeks', '?')} 週成長紀錄",
-                        "weight": "bold",
-                        "size": "xl",
-                        "color": "#ff7fa8"
+                        "type": "box",
+                        "layout": "horizontal",
+                        "contents": [
+                            {
+                                "type": "text",
+                                "text": "👶",
+                                "size": "xxl",
+                                "flex": 0
+                            },
+                            {
+                                "type": "box",
+                                "layout": "vertical",
+                                "contents": [
+                                    {
+                                        "type": "text",
+                                        "text": f"第 {weeks} 週",
+                                        "weight": "bold",
+                                        "size": "xxl",
+                                        "color": "#D4548E"
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": "成長紀錄 🍼",
+                                        "size": "sm",
+                                        "color": "#E88DB6"
+                                    }
+                                ],
+                                "paddingStart": "12px"
+                            }
+                        ],
+                        "alignItems": "center"
                     }
                 ]
             },
             "body": {
                 "type": "box",
                 "layout": "vertical",
+                "spacing": "md",
+                "paddingAll": "20px",
                 "contents": [
                     {
                         "type": "text",
-                        "text": result_json.get('message', '媽咪好，我是寶寶！'),
+                        "text": message,
                         "wrap": True,
-                        "size": "md"
+                        "size": "md",
+                        "color": "#555555",
+                        "lineSpacing": "8px"
+                    },
+                    {
+                        "type": "separator",
+                        "margin": "lg",
+                        "color": "#FFE4E1"
+                    },
+                    {
+                        "type": "box",
+                        "layout": "horizontal",
+                        "margin": "lg",
+                        "contents": [
+                            {
+                                "type": "text",
+                                "text": "📊 體重狀態",
+                                "size": "sm",
+                                "color": "#AAAAAA",
+                                "flex": 0
+                            },
+                            {
+                                "type": "text",
+                                "text": weight_status if weight_status else "—",
+                                "size": "sm",
+                                "color": "#D4548E",
+                                "align": "end",
+                                "weight": "bold"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "backgroundColor": "#FFF8FA",
+                "paddingAll": "12px",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": "💕 寶寶健康成長中 💕",
+                        "size": "xs",
+                        "color": "#E88DB6",
+                        "align": "center"
                     }
                 ]
             }
