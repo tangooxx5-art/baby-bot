@@ -54,7 +54,7 @@ line_configuration = None
 line_handler = None
 
 # 固定使用的 Gemini 模型（不再動態偵測，節省 API 配額）
-GEMINI_MODEL = 'gemini-3-flash'
+GEMINI_MODEL = 'gemini-2.5-flash'
 
 
 def get_line_config():
